@@ -1,5 +1,6 @@
 import Avatar from '../components/Avatar';
 import { LogOutIcon, MailIcon, MapPinIcon, PhoneIcon } from '../components/icons';
+import NotificationSettings from '../components/NotificationSettings';
 import { useAuth } from '../context/AuthContext';
 
 export default function Profile() {
@@ -40,6 +41,8 @@ export default function Profile() {
         </li>
       </ul>
       <p className="muted small center">Your mobile number and email are private and never shown to other users.</p>
+
+      <NotificationSettings />
 
       <button type="button" className="btn danger-outline block" onClick={logout}>
         <LogOutIcon size={18} /> Log out

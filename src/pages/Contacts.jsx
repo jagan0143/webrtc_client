@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { errorMessage, http } from '../api/http';
 import { SearchIcon, UsersIcon } from '../components/icons';
+import NotificationBanner from '../components/NotificationBanner';
 import UserListItem from '../components/UserListItem';
 import { useAuth } from '../context/AuthContext';
 import { useCall } from '../context/CallContext';
@@ -68,6 +69,7 @@ export default function Contacts() {
 
   return (
     <div className="contacts">
+      <NotificationBanner />
       <div className="search">
         <SearchIcon size={18} />
         <input

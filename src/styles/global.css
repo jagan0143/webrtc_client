@@ -961,6 +961,134 @@ a {
   }
 }
 
+/* ---------- notifications ---------- */
+.banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 6px 12px 8px;
+  padding: 12px 10px 12px 14px;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.banner-icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--accent);
+}
+
+.banner-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.banner-body p {
+  margin: 0;
+}
+
+.banner-error {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.banner-close {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  margin: -6px -4px 0 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--text-2);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.btn.small-btn {
+  height: 38px;
+  padding: 0 16px;
+  font-size: 14px;
+  border-radius: 10px;
+}
+
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.settings-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  color: var(--text-2);
+}
+
+.settings-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.settings-title {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-desc,
+.settings-info {
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.35;
+  margin: 0;
+}
+
+.switch {
+  flex: none;
+  position: relative;
+  width: 51px;
+  height: 31px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--border);
+  transition: background 0.2s;
+}
+
+.switch.on {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: transform 0.2s;
+}
+
+.switch.on .switch-knob {
+  transform: translateX(20px);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -1,5 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { http } from '../api/http';
+import { closeNotifications } from '../push/push';
 import {
   createPeer,
   DEFAULT_ICE_SERVERS,
@@ -22,13 +24,19 @@ import { useSocket } from './SocketContext';
  *
  * Every function below reads live values from refs, so the socket listeners
  * registered once per socket never see stale state.
+ *
+ * Phones suspend web apps in the background, so a call can briefly lose its socket.
+ * The server keeps the call for a grace period; on reconnect we send call:rejoin and
+ * the caller restarts ICE. Calls can also be opened from a push notification
+ * (/?call=<id>&action=answer|open, or a message from the service worker).
  */
 
 const CallContext = createContext(null);
 
 const ENDED_SCREEN_MS = 2000;
 const CONNECT_TIMEOUT_MS = 30_000;
-const RECONNECT_GRACE_MS = 10_000;
+// Slightly longer than the server's CALL_RECONNECT_GRACE_MS so the server decides first.
+const RECONNECT_GRACE_MS = 25_000;
 
 const IDLE = {
   status: 'idle',
@@ -42,11 +50,21 @@ const IDLE = {
 };
 
 const isFree = (status) => status === 'idle' || status === 'ended';
+const isLive = (status) => status === 'connecting' || status === 'in-call';
+
+/** Call opened from a notification tap, read before the router rewrites the URL. */
+function readOpenParams() {
+  const params = new URLSearchParams(window.location.search);
+  const callId = params.get('call');
+  return callId ? { callId, action: params.get('action') === 'answer' ? 'answer' : 'open' } : null;
+}
 const stopTracks = (stream) => stream?.getTracks().forEach((t) => t.stop());
 
 export function CallProvider({ children }) {
   const { user } = useAuth();
   const { socket } = useSocket();
+  const navigate = useNavigate();
+  const [openParams] = useState(readOpenParams);
 
   const [call, setCallState] = useState(IDLE);
   const [localStream, setLocalStream] = useState(null);
@@ -71,6 +89,7 @@ export function CallProvider({ children }) {
   const facingRef = useRef('user');
   const cameraBusyRef = useRef(false);
   const iceRestartedRef = useRef(false);
+  const pendingOpenRef = useRef(null); // { callId, action } waiting for the server to re-send the call
   const stopToneRef = useRef(null);
   const timersRef = useRef({});
 
@@ -117,6 +136,7 @@ export function CallProvider({ children }) {
   const teardown = () => {
     stopTone();
     setTimer('connect', null);
+    setTimer('rejoin', null);
     const pc = pcRef.current;
     if (pc) {
       pc.onicecandidate = null;
@@ -171,6 +191,18 @@ export function CallProvider({ children }) {
     emit('webrtc:offer', { callId: callRef.current.callId, sdp: describe(pc.localDescription) });
   };
 
+  /** Caller only: renegotiate ICE after a network change or the other side reconnecting. */
+  const restartIce = async () => {
+    const pc = pcRef.current;
+    if (!pc || callRef.current.direction !== 'outgoing') return;
+    try {
+      if (pc.signalingState === 'have-local-offer') await pc.setLocalDescription({ type: 'rollback' });
+      await sendOffer({ iceRestart: true });
+    } catch (err) {
+      console.warn('ICE restart failed', err);
+    }
+  };
+
   const flushIce = async () => {
     const queued = pendingIceRef.current;
     pendingIceRef.current = [];
@@ -199,7 +231,7 @@ export function CallProvider({ children }) {
         if (c.direction === 'outgoing' && !iceRestartedRef.current) {
           iceRestartedRef.current = true;
           setCall({ message: 'Reconnecting…' });
-          sendOffer({ iceRestart: true }).catch(() => {});
+          void restartIce();
           setTimer('connect', () => endCall('Connection lost', 'failed'), RECONNECT_GRACE_MS);
         } else if (c.direction === 'outgoing') {
           endCall('Connection lost', 'failed');
@@ -407,7 +439,9 @@ export function CallProvider({ children }) {
   // ---------- socket events ----------
 
   const onIncoming = ({ callId, from, media }) => {
-    if (!isFree(callRef.current.status)) {
+    const { status } = callRef.current;
+    if (isCurrent(callId) && !isFree(status)) return; // re-sent after a reconnect; already showing
+    if (!isFree(status)) {
       emit('call:reject', { callId });
       return;
     }
@@ -422,6 +456,38 @@ export function CallProvider({ children }) {
     });
     stopToneRef.current = startRingtone();
     document.title = `📞 ${from.name} is calling…`;
+    // The in-app screen replaces any "is calling" notification.
+    void closeNotifications((d) => d.callId === callId);
+
+    const pending = pendingOpenRef.current;
+    if (pending?.callId === callId) {
+      pendingOpenRef.current = null;
+      if (pending.action === 'answer') void acceptCall();
+    }
+  };
+
+  /** A notification was tapped: show that call if it's still ringing, otherwise the missed list. */
+  const checkPendingOpen = async () => {
+    const pending = pendingOpenRef.current;
+    if (!pending || !socketRef.current?.connected) return;
+    const res = await emitAck('call:rejoin', { callId: pending.callId });
+    if (res.error || pendingOpenRef.current !== pending) return;
+    // 'ringing': the server re-sent call:incoming, which onIncoming picks up.
+    if (res.state !== 'ringing') {
+      pendingOpenRef.current = null;
+      void navigate('/missed');
+    }
+  };
+
+  const openFromNotification = (callId, action = 'open') => {
+    if (!callId) return;
+    const c = callRef.current;
+    if (isCurrent(callId) && !isFree(c.status)) {
+      if (c.status === 'incoming' && action === 'answer') void acceptCall();
+      return;
+    }
+    pendingOpenRef.current = { callId, action };
+    void checkPendingOpen(); // if not connected yet, onConnect does it
   };
 
   const onAccepted = async ({ callId, video }) => {
@@ -524,8 +590,50 @@ export function CallProvider({ children }) {
   };
 
   const onSocketDisconnect = () => {
-    // The server ends our calls when this socket drops, so mirror that locally.
-    if (!isFree(callRef.current.status)) finish('Connection lost');
+    const { status } = callRef.current;
+    // The server cancels a call we were dialling; an answered call gets a grace period.
+    if (status === 'outgoing') finish('Connection lost');
+    else if (isLive(status)) {
+      setCall({ message: 'Reconnecting…' });
+      setTimer('rejoin', () => endCall('Connection lost', 'failed'), RECONNECT_GRACE_MS);
+    }
+  };
+
+  const onConnect = async () => {
+    void closeNotifications((d) => d.type === 'incoming-call' && !isCurrent(d.callId));
+    void checkPendingOpen();
+
+    const c = callRef.current;
+    if (!c.callId || isFree(c.status) || c.status === 'outgoing') return;
+    const res = await emitAck('call:rejoin', { callId: c.callId });
+    if (res.error || !isCurrent(c.callId) || isFree(callRef.current.status)) return;
+
+    if (callRef.current.status === 'incoming') {
+      if (res.state !== 'ringing') finish('Call ended');
+      return;
+    }
+    if (res.state !== 'ongoing') {
+      finish('Call ended');
+      return;
+    }
+    setTimer('rejoin', null);
+    // Media usually kept flowing while only the socket was down; then nothing else would clear the message.
+    if (callRef.current.status === 'in-call' && pcRef.current?.connectionState === 'connected') {
+      setCall({ message: '' });
+    }
+    void restartIce();
+  };
+
+  const onPeerReconnecting = ({ callId }) => {
+    if (isCurrent(callId) && callRef.current.status === 'in-call') setCall({ message: 'Reconnecting…' });
+  };
+
+  const onPeerResumed = ({ callId }) => {
+    if (!isCurrent(callId) || !isLive(callRef.current.status)) return;
+    if (callRef.current.status === 'in-call' && pcRef.current?.connectionState === 'connected') {
+      setCall({ message: '' });
+    }
+    void restartIce();
   };
 
   useEffect(() => {
@@ -542,6 +650,9 @@ export function CallProvider({ children }) {
       'webrtc:offer': onOffer,
       'webrtc:answer': onAnswer,
       'webrtc:ice': onIce,
+      'call:peer-reconnecting': onPeerReconnecting,
+      'call:peer-resumed': onPeerResumed,
+      connect: onConnect,
       disconnect: onSocketDisconnect,
     };
     for (const [event, fn] of Object.entries(handlers)) socket.on(event, fn);
@@ -554,6 +665,46 @@ export function CallProvider({ children }) {
       }
     };
   }, [socket]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Opened from a notification: via the URL on a cold start, or a service-worker message if already open.
+  useEffect(() => {
+    if (openParams) openFromNotification(openParams.callId, openParams.action);
+    if (!('serviceWorker' in navigator)) return undefined;
+    const onMessage = (event) => {
+      const d = event.data || {};
+      if (d.type === 'open-call') openFromNotification(d.callId, d.action);
+      else if (d.type === 'navigate' && typeof d.url === 'string' && d.url.startsWith('/')) void navigate(d.url);
+    };
+    navigator.serviceWorker.addEventListener('message', onMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onMessage);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keep the screen on during a call (re-acquired when the app comes back to the foreground).
+  const callIsLive = isLive(call.status);
+  useEffect(() => {
+    if (!callIsLive || !('wakeLock' in navigator)) return undefined;
+    let lock = null;
+    let stopped = false;
+    const acquire = async () => {
+      if (lock || stopped || document.visibilityState !== 'visible') return;
+      try {
+        lock = await navigator.wakeLock.request('screen');
+        lock.addEventListener('release', () => {
+          lock = null;
+        });
+        if (stopped) await lock.release();
+      } catch {
+        /* denied (e.g. battery saver) */
+      }
+    };
+    void acquire();
+    document.addEventListener('visibilitychange', acquire);
+    return () => {
+      stopped = true;
+      document.removeEventListener('visibilitychange', acquire);
+      lock?.release().catch(() => {});
+    };
+  }, [callIsLive]);
 
   // ICE servers (STUN/TURN) come from the server.
   useEffect(() => {
